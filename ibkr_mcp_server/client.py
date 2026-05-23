@@ -243,72 +243,187 @@ class IBKRClient:
     
     @rate_limit(calls_per_second=0.5)
     async def get_shortable_shares(self, symbol: str, account: str = None) -> Dict:
-        """Get short selling information for a symbol."""
+        """Get short selling availability for a symbol.
+
+        ib_async 2.x removed the standalone reqShortableSharesAsync. Shortable
+        data now arrives as generic ticks on reqMktData:
+          - tick 236 → ticker.shortable    (1=NotAvail, 2=HardToBorrow, 3=Available)
+          - tick 236 → ticker.shortableShares  (numeric available count; -1=unlimited)
+        We subscribe with generic tick "236" and read the ticker after a short wait.
+        """
         try:
             if not await self._ensure_connected():
                 raise ConnectionError("Not connected to IBKR")
-            
+
             contract = Stock(symbol, 'SMART', 'USD')
-            
+
             # Qualify the contract
             qualified_contracts = await self.ib.reqContractDetailsAsync(contract)
             if not qualified_contracts:
                 return {"error": "Contract not found"}
-            
+
             qualified_contract = qualified_contracts[0].contract
-            
-            # Request shortable shares
-            shortable_shares = await self.ib.reqShortableSharesAsync(qualified_contract)
-            
-            # Get current market data
-            ticker = self.ib.reqMktData(qualified_contract, '', False, False)
-            await asyncio.sleep(1.5)  # Wait for market data
-            
-            result = {
-                "symbol": symbol,
-                "shortable_shares": shortable_shares if shortable_shares != -1 else "Unlimited",
-                "current_price": safe_float(ticker.last or ticker.close),
-                "bid": safe_float(ticker.bid),
-                "ask": safe_float(ticker.ask),
-                "contract_id": qualified_contract.conId
-            }
-            
-            # Clean up ticker
-            self.ib.cancelMktData(qualified_contract)
-            
-            return result
-            
+
+            # Subscribe with generic tick 236 for Shortable + ShortableShares.
+            ticker = self.ib.reqMktData(qualified_contract, '236', False, False)
+            try:
+                await asyncio.sleep(2.0)  # Allow ticks to land
+
+                # ticker.shortable: 1=NotAvail, 2=HardToBorrow, 3=Available
+                shortable_code = getattr(ticker, 'shortable', None)
+                shortable_label = {
+                    1: "Not available",
+                    2: "Hard to borrow",
+                    3: "Available",
+                }.get(int(shortable_code) if shortable_code and shortable_code > 0 else 0, "Unknown")
+
+                # ticker.shortableShares: numeric count (-1 means "unlimited")
+                shortable_shares_raw = getattr(ticker, 'shortableShares', None)
+                shortable_shares = (
+                    "Unlimited"
+                    if shortable_shares_raw is not None and shortable_shares_raw == -1
+                    else safe_float(shortable_shares_raw)
+                )
+
+                result = {
+                    "symbol": symbol,
+                    "shortable": shortable_label,
+                    "shortable_code": safe_float(shortable_code),
+                    "shortable_shares": shortable_shares,
+                    "current_price": safe_float(ticker.last or ticker.close),
+                    "bid": safe_float(ticker.bid),
+                    "ask": safe_float(ticker.ask),
+                    "contract_id": qualified_contract.conId,
+                }
+                return result
+            finally:
+                # Clean up ticker
+                try:
+                    self.ib.cancelMktData(qualified_contract)
+                except Exception:
+                    pass
+
         except Exception as e:
             self.logger.error(f"Error getting shortable shares for {symbol}: {e}")
             return {"error": str(e)}
 
     @retry_on_failure(max_attempts=2)
-    async def get_margin_requirements(self, symbol: str, account: str = None) -> Dict:
-        """Get margin requirements for a symbol."""
+    async def get_margin_requirements(
+        self,
+        symbol: str,
+        account: str = None,
+        action: str = 'BUY',
+        quantity: int = 1,
+    ) -> Dict:
+        """Get init/maint margin requirements for a single share via whatIfOrderAsync.
+
+        IBKR's API has no direct "what's the margin for this symbol" call. The
+        canonical way is to submit a what-if order (validates without placing)
+        and read the OrderState's margin-change fields.
+
+        Args:
+          action: 'BUY' (long) or 'SELL' (short).
+          quantity: number of shares for the whatIf — defaults to 1 so the
+            returned margin numbers are per-share and easy to scale.
+        """
         try:
             if not await self._ensure_connected():
                 raise ConnectionError("Not connected to IBKR")
-                
-            # Create contract
+
+            # qualifyContractsAsync is varargs — pass Contract, NOT a list, otherwise
+            # ib_async raises `'list' object has no attribute 'includeExpired'`.
             contract = Stock(symbol, 'SMART', 'USD')
-            await self.ib.qualifyContractsAsync([contract])
-            
+            await self.ib.qualifyContractsAsync(contract)
+
             if not contract.conId:
                 return {"error": f"Invalid symbol: {symbol}"}
-            
-            # Get margin requirements - simplified for now
-            # Note: IBKR API doesn't provide direct margin requirements
-            # This would typically require additional market data subscriptions
-            margin_info = {
+
+            order = Order()
+            order.action = action.upper()
+            order.orderType = 'MKT'
+            order.totalQuantity = quantity
+            order.tif = 'DAY'
+            if account or self.current_account:
+                order.account = account or self.current_account
+
+            # ib_async's whatIfOrderAsync awaits an event that never fires when the
+            # order is rejected by Error 321 (Read-Only API mode). Wrap in a hard
+            # timeout so we can surface that condition instead of hanging forever.
+            ro_blocked = False
+            ro_msg = ""
+
+            def _on_err(reqId, errorCode, errorString, contract_):
+                nonlocal ro_blocked, ro_msg
+                if errorCode == 321 or 'Read-Only' in errorString:
+                    ro_blocked = True
+                    ro_msg = errorString
+
+            self.ib.errorEvent += _on_err
+            try:
+                order_state = await asyncio.wait_for(
+                    self.ib.whatIfOrderAsync(contract, order),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                if ro_blocked:
+                    return {
+                        "symbol": symbol,
+                        "contract_id": contract.conId,
+                        "blocked": True,
+                        "reason": "IB Gateway is in Read-Only API mode — whatIfOrder rejected (Error 321).",
+                        "ibkr_message": ro_msg,
+                        "hint": (
+                            "Disable 'Read-Only API' in Gateway → Configuration → API → "
+                            "Settings, then restart the Gateway. Real margin numbers are only "
+                            "available once Read-Only is OFF."
+                        ),
+                    }
+                return {
+                    "symbol": symbol,
+                    "contract_id": contract.conId,
+                    "error": "whatIfOrderAsync timed out without IB response",
+                    "hint": "Gateway responsive but order-state event never fired. Check Gateway logs.",
+                }
+            except Exception as wif_e:
+                msg = str(wif_e)
+                if 'Read-Only' in msg or 'read-only' in msg.lower():
+                    return {
+                        "symbol": symbol,
+                        "contract_id": contract.conId,
+                        "blocked": True,
+                        "reason": "IB Gateway is in Read-Only API mode — whatIfOrder rejected.",
+                        "hint": (
+                            "Disable 'Read-Only API' in Gateway → Configuration → API → "
+                            "Settings, then restart the Gateway."
+                        ),
+                    }
+                raise
+            finally:
+                try:
+                    self.ib.errorEvent -= _on_err
+                except Exception:
+                    pass
+
+            return {
                 "symbol": symbol,
                 "contract_id": contract.conId,
                 "exchange": contract.exchange,
-                "margin_requirement": "Market data subscription required",
-                "note": "Use TWS for detailed margin calculations"
+                "action": order.action,
+                "quantity": quantity,
+                "init_margin_change": safe_float(getattr(order_state, 'initMarginChange', None)),
+                "maint_margin_change": safe_float(getattr(order_state, 'maintMarginChange', None)),
+                "equity_with_loan_change": safe_float(getattr(order_state, 'equityWithLoanChange', None)),
+                "commission": safe_float(getattr(order_state, 'commission', None)),
+                "commission_currency": getattr(order_state, 'commissionCurrency', None),
+                "min_commission": safe_float(getattr(order_state, 'minCommission', None)),
+                "max_commission": safe_float(getattr(order_state, 'maxCommission', None)),
+                "warning_text": getattr(order_state, 'warningText', None),
+                "note": (
+                    "Margins are absolute deltas (USD/EUR per account currency) for the "
+                    f"whatIf {order.action} of {quantity} share(s). Scale linearly for size."
+                ),
             }
-            
-            return margin_info
-            
+
         except Exception as e:
             self.logger.error(f"Error getting margin info for {symbol}: {e}")
             return {"error": str(e)}
@@ -562,6 +677,7 @@ class IBKRClient:
         underlying_currency: str = 'USD',
         max_strikes: int = 40,
         wait_seconds: float = 3.0,
+        trading_class: Optional[str] = None,
     ) -> Dict:
         """Get option chain for an underlying with per-strike Greeks/IV/OI/Volume.
 
@@ -571,6 +687,10 @@ class IBKRClient:
         - `right`: 'C' (calls only), 'P' (puts only), or 'BOTH'.
         - `max_strikes`: cap on strikes to stream — respects the 100-line cap.
           With both rights this means up to 2 × max_strikes contracts streaming.
+        - `trading_class`: explicit override (e.g. 'SPXW' for SPX weeklies).
+          When omitted, picks the chain where tradingClass matches the underlying
+          symbol with the largest strike list (avoids secondary classes like '2SPY'
+          that only carry a handful of legacy strikes).
 
         Without OPRA Top-of-Book subscription, IBKR returns 15-min-delayed quotes
         via the `reqMarketDataType(3)` setting in .env. Greeks/IV from modelGreeks
@@ -590,7 +710,7 @@ class IBKRClient:
                 return {"error": f"Underlying contract not found: {underlying}"}
             underlying_contract = qualified[0].contract
 
-            # Get the chain (expirations + strikes per exchange)
+            # Get the chain (expirations + strikes per exchange × tradingClass)
             chains = await self.ib.reqSecDefOptParamsAsync(
                 underlyingSymbol=underlying_contract.symbol,
                 futFopExchange='',
@@ -600,8 +720,28 @@ class IBKRClient:
             if not chains:
                 return {"error": f"No options chain available for {underlying}"}
 
-            # Prefer SMART; fall back to first
-            chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
+            # Chain picker: SPY/SPX/etc. expose multiple chains per exchange/tradingClass.
+            # The primary chain has the most strikes; secondary classes (e.g. '2SPY')
+            # have <10 stale legacy strikes. Default: prefer tradingClass==symbol AND
+            # SMART exchange, then largest-strike-list SMART, then largest overall.
+            smart_chains = [c for c in chains if c.exchange == 'SMART']
+            pool = smart_chains if smart_chains else chains
+
+            chain = None
+            if trading_class:
+                tc_matches = [c for c in pool if c.tradingClass == trading_class]
+                if not tc_matches:
+                    return {
+                        "error": f"No chain with tradingClass='{trading_class}'",
+                        "available_classes": sorted({c.tradingClass for c in pool}),
+                    }
+                chain = max(tc_matches, key=lambda c: len(c.strikes))
+            else:
+                symbol_matches = [c for c in pool if c.tradingClass == underlying_contract.symbol]
+                if symbol_matches:
+                    chain = max(symbol_matches, key=lambda c: len(c.strikes))
+                else:
+                    chain = max(pool, key=lambda c: len(c.strikes))
 
             # Pick expiry
             expirations = sorted(chain.expirations)

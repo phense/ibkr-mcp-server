@@ -206,7 +206,8 @@ TOOLS = [
                 "underlying_exchange": {"type": "string", "default": "SMART"},
                 "underlying_currency": {"type": "string", "default": "USD"},
                 "max_strikes": {"type": "integer", "default": 40, "description": "Cap on strikes streamed (respects 100-line cap; with both rights this becomes 2×)."},
-                "wait_seconds": {"type": "number", "default": 3.0, "description": "How long to wait for ticks/Greeks to populate before snapshotting."}
+                "wait_seconds": {"type": "number", "default": 3.0, "description": "How long to wait for ticks/Greeks to populate before snapshotting."},
+                "trading_class": {"type": "string", "description": "Explicit trading-class override (e.g. 'SPXW' for SPX weeklies). When omitted, prefers tradingClass==symbol with the largest strike list — avoids secondary classes like '2SPY'."}
             },
             "required": ["underlying"],
             "additionalProperties": False
@@ -372,6 +373,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 )]
                 
         elif name == "get_connection_status":
+            # Lazy-connect on first invocation after MCP start so this tool
+            # reports the *intended* state, not a pre-connect false-negative.
+            try:
+                await ibkr_client._ensure_connected()
+            except Exception as e:
+                ibkr_client.logger.warning(f"get_connection_status: ensure_connected failed: {e}")
             status = {
                 "connected": ibkr_client.is_connected(),
                 "host": ibkr_client.host,
@@ -445,6 +452,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 underlying_currency=arguments.get("underlying_currency", "USD"),
                 max_strikes=arguments.get("max_strikes", 40),
                 wait_seconds=arguments.get("wait_seconds", 3.0),
+                trading_class=arguments.get("trading_class"),
             )
             return [TextContent(
                 type="text",
