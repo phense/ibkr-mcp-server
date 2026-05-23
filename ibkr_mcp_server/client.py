@@ -165,17 +165,21 @@ class IBKRClient:
             if not await self._ensure_connected():
                 raise ConnectionError("Not connected to IBKR")
             
-            account = account or self.current_account or "All"
-            
-            summary_tags = [
+            account = account or self.current_account or ""
+
+            wanted_tags = {
                 'TotalCashValue', 'NetLiquidation', 'UnrealizedPnL', 'RealizedPnL',
                 'GrossPositionValue', 'BuyingPower', 'EquityWithLoanValue',
                 'PreviousDayEquityWithLoanValue', 'FullInitMarginReq', 'FullMaintMarginReq'
+            }
+
+            account_values = await self.ib.accountSummaryAsync(account)
+
+            return [
+                self._serialize_account_value(av)
+                for av in account_values
+                if av.tag in wanted_tags
             ]
-            
-            account_values = await self.ib.reqAccountSummaryAsync(account, ','.join(summary_tags))
-            
-            return [self._serialize_account_value(av) for av in account_values]
             
         except Exception as e:
             self.logger.error(f"Account summary request failed: {e}")
