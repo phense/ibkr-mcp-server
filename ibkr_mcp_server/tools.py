@@ -100,6 +100,31 @@ TOOLS = [
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
     ),
     Tool(
+        name="get_option_chain",
+        description=(
+            "Get option chain for an underlying — strikes, Greeks (delta/gamma/vega/theta), "
+            "IV, bid/ask, volume, open interest per contract. Pre-prune with min_strike/max_strike/right "
+            "to respect the 100-line market-data cap. Without OPRA subscription, returns 15-min-delayed."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "underlying": {"type": "string", "description": "Underlying ticker (e.g. SPY, AAPL)."},
+                "expiry": {"type": "string", "default": "nearest", "description": "'nearest' (earliest available) or 'YYYYMMDD' / 'YYYYMM' (prefix match)."},
+                "min_strike": {"type": ["number", "null"], "default": None},
+                "max_strike": {"type": ["number", "null"], "default": None},
+                "right": {"type": "string", "enum": ["C", "P", "BOTH"], "default": "BOTH"},
+                "underlying_sec_type": {"type": "string", "default": "STK"},
+                "underlying_exchange": {"type": "string", "default": "SMART"},
+                "underlying_currency": {"type": "string", "default": "USD"},
+                "max_strikes": {"type": "integer", "default": 40, "description": "Cap on strikes streamed (respects 100-line cap; with both rights this becomes 2×)."},
+                "wait_seconds": {"type": "number", "default": 3.0, "description": "How long to wait for ticks/Greeks to populate before snapshotting."}
+            },
+            "required": ["underlying"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
         name="get_historical_bars",
         description=(
             "Fetch historical OHLCV bars for a stock/index/future/option/forex. "
@@ -271,6 +296,24 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             return [TextContent(
                 type="text",
                 text=json.dumps(status, indent=2)
+            )]
+
+        elif name == "get_option_chain":
+            result = await ibkr_client.get_option_chain(
+                underlying=arguments["underlying"],
+                expiry=arguments.get("expiry", "nearest"),
+                min_strike=arguments.get("min_strike"),
+                max_strike=arguments.get("max_strike"),
+                right=arguments.get("right", "BOTH"),
+                underlying_sec_type=arguments.get("underlying_sec_type", "STK"),
+                underlying_exchange=arguments.get("underlying_exchange", "SMART"),
+                underlying_currency=arguments.get("underlying_currency", "USD"),
+                max_strikes=arguments.get("max_strikes", 40),
+                wait_seconds=arguments.get("wait_seconds", 3.0),
+            )
+            return [TextContent(
+                type="text",
+                text=json.dumps(result, indent=2, default=str)
             )]
 
         elif name == "get_historical_bars":

@@ -549,6 +549,177 @@ class IBKRClient:
             self.logger.error(f"Historical bars request failed for {symbol}: {e}")
             return {"error": str(e)}
 
+    @rate_limit(calls_per_second=0.2)
+    async def get_option_chain(
+        self,
+        underlying: str,
+        expiry: str = 'nearest',
+        min_strike: Optional[float] = None,
+        max_strike: Optional[float] = None,
+        right: str = 'BOTH',
+        underlying_sec_type: str = 'STK',
+        underlying_exchange: str = 'SMART',
+        underlying_currency: str = 'USD',
+        max_strikes: int = 40,
+        wait_seconds: float = 3.0,
+    ) -> Dict:
+        """Get option chain for an underlying with per-strike Greeks/IV/OI/Volume.
+
+        - `expiry`: 'nearest' (default — earliest expiration), or 'YYYYMMDD' / 'YYYYMM'
+          (first match if a prefix).
+        - `min_strike` / `max_strike`: optional window for strike filter.
+        - `right`: 'C' (calls only), 'P' (puts only), or 'BOTH'.
+        - `max_strikes`: cap on strikes to stream — respects the 100-line cap.
+          With both rights this means up to 2 × max_strikes contracts streaming.
+
+        Without OPRA Top-of-Book subscription, IBKR returns 15-min-delayed quotes
+        via the `reqMarketDataType(3)` setting in .env. Greeks/IV from modelGreeks
+        are computed regardless of subscription tier.
+        """
+        try:
+            if not await self._ensure_connected():
+                raise IBKRConnectionError("Not connected to IBKR")
+
+            # Resolve underlying conId
+            underlying_contract = _make_contract(
+                symbol=underlying, sec_type=underlying_sec_type,
+                exchange=underlying_exchange, currency=underlying_currency,
+            )
+            qualified = await self.ib.reqContractDetailsAsync(underlying_contract)
+            if not qualified:
+                return {"error": f"Underlying contract not found: {underlying}"}
+            underlying_contract = qualified[0].contract
+
+            # Get the chain (expirations + strikes per exchange)
+            chains = await self.ib.reqSecDefOptParamsAsync(
+                underlyingSymbol=underlying_contract.symbol,
+                futFopExchange='',
+                underlyingSecType=underlying_contract.secType,
+                underlyingConId=underlying_contract.conId,
+            )
+            if not chains:
+                return {"error": f"No options chain available for {underlying}"}
+
+            # Prefer SMART; fall back to first
+            chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
+
+            # Pick expiry
+            expirations = sorted(chain.expirations)
+            if expiry == 'nearest':
+                target_expiry = expirations[0] if expirations else ''
+            else:
+                matches = [e for e in expirations if e.startswith(expiry)]
+                if not matches:
+                    return {
+                        "error": f"No expiry matches '{expiry}'",
+                        "available_expirations": expirations[:20],
+                    }
+                target_expiry = matches[0]
+            if not target_expiry:
+                return {"error": f"No expirations available for {underlying}"}
+
+            # Filter strikes
+            strikes = sorted(float(s) for s in chain.strikes)
+            if min_strike is not None:
+                strikes = [s for s in strikes if s >= min_strike]
+            if max_strike is not None:
+                strikes = [s for s in strikes if s <= max_strike]
+            if len(strikes) > max_strikes:
+                # Truncate around the middle of the surviving window (ATM heuristic)
+                mid = len(strikes) // 2
+                half = max_strikes // 2
+                strikes = strikes[max(0, mid - half):mid + half]
+
+            rights = ['C', 'P'] if right.upper() == 'BOTH' else [right.upper()]
+
+            # Build and qualify option contracts
+            raw_contracts: List[Contract] = []
+            for k in strikes:
+                for r in rights:
+                    opt = Option(
+                        underlying_contract.symbol,
+                        lastTradeDateOrContractMonth=target_expiry,
+                        strike=k,
+                        right=r,
+                        exchange=chain.exchange,
+                        currency=underlying_contract.currency,
+                    )
+                    opt.tradingClass = chain.tradingClass
+                    opt.multiplier = chain.multiplier
+                    raw_contracts.append(opt)
+
+            await self.ib.qualifyContractsAsync(*raw_contracts)
+            contracts = [c for c in raw_contracts if c.conId]
+            if not contracts:
+                return {
+                    "error": "No option contracts qualified",
+                    "tried_strikes": strikes,
+                    "tried_expiry": target_expiry,
+                }
+
+            # Stream market data for each contract with OI/Vol generic ticks.
+            # Greeks/IV come automatically via tick types 10-13.
+            tickers = [
+                self.ib.reqMktData(c, '100,101', False, False)
+                for c in contracts
+            ]
+            try:
+                await asyncio.sleep(wait_seconds)
+                entries = []
+                for tk in tickers:
+                    c = tk.contract
+                    oi = (
+                        safe_float(getattr(tk, 'callOpenInterest', 0))
+                        if c.right == 'C'
+                        else safe_float(getattr(tk, 'putOpenInterest', 0))
+                    )
+                    entry = {
+                        "strike": safe_float(c.strike),
+                        "right": c.right,
+                        "expiry": c.lastTradeDateOrContractMonth,
+                        "contract_id": c.conId,
+                        "bid": safe_float(tk.bid),
+                        "ask": safe_float(tk.ask),
+                        "last": safe_float(tk.last),
+                        "volume": safe_float(tk.volume),
+                        "open_interest": oi,
+                    }
+                    if tk.modelGreeks is not None:
+                        mg = tk.modelGreeks
+                        entry.update({
+                            "iv": safe_float(mg.impliedVol),
+                            "delta": safe_float(mg.delta),
+                            "gamma": safe_float(mg.gamma),
+                            "vega": safe_float(mg.vega),
+                            "theta": safe_float(mg.theta),
+                            "underlying_price": safe_float(mg.undPrice),
+                            "option_price": safe_float(mg.optPrice),
+                        })
+                    entries.append(entry)
+                return {
+                    "underlying": underlying_contract.symbol,
+                    "underlying_conId": underlying_contract.conId,
+                    "expiry": target_expiry,
+                    "exchange": chain.exchange,
+                    "trading_class": chain.tradingClass,
+                    "multiplier": chain.multiplier,
+                    "strike_count": len(strikes),
+                    "contract_count": len(contracts),
+                    "expirations_available": expirations,
+                    "strikes_in_window": strikes,
+                    "contracts": entries,
+                }
+            finally:
+                for c in contracts:
+                    try:
+                        self.ib.cancelMktData(c)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            self.logger.error(f"Option chain request failed for {underlying}: {e}")
+            return {"error": str(e)}
+
     async def get_accounts(self) -> Dict[str, Union[str, List[str]]]:
         """Get available accounts information."""
         try:
