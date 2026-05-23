@@ -1,9 +1,16 @@
 """Configuration management for IBKR MCP Server."""
 
 import os
+from pathlib import Path
 from typing import List, Optional
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
+
+# Pin env_file to this package's repo root so the server's settings load
+# correctly regardless of the cwd the host (e.g. Claude Code MCP launcher)
+# chooses when spawning the process. Without this the loader picks up an
+# unrelated .env from the host's cwd and crashes on extra keys.
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -57,9 +64,10 @@ class Settings(BaseSettings):
         return v.upper()
     
     model_config = {
-        "env_file": ".env",
+        "env_file": str(_ENV_FILE),
         "env_file_encoding": "utf-8",
-        "case_sensitive": False
+        "case_sensitive": False,
+        "extra": "ignore",
     }
 
 
