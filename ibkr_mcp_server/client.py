@@ -5,7 +5,7 @@ import logging
 from typing import Dict, List, Optional, Union
 from decimal import Decimal
 
-from ib_async import IB, Stock, Index, Future, Option, Forex, Contract, util
+from ib_async import IB, Stock, Index, Future, Option, Forex, Contract, ComboLeg, Order, util
 from .config import settings
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
@@ -837,6 +837,147 @@ class IBKRClient:
             }
         except Exception as e:
             self.logger.error(f"News request failed for {symbol}: {e}")
+            return {"error": str(e)}
+
+    async def place_combo_order(
+        self,
+        underlying: str,
+        legs: List[Dict],
+        order_action: str = 'BUY',
+        quantity: int = 1,
+        limit_price: float = 0.0,
+        order_type: str = 'LMT',
+        tif: str = 'DAY',
+        account: Optional[str] = None,
+        currency: str = 'USD',
+        exchange: str = 'SMART',
+        dry_run: bool = True,
+    ) -> Dict:
+        """Place a multi-leg combo order (BAG contract). Designed for credit spreads.
+
+        SAFETY GATES (all must pass):
+          1. settings.enable_live_trading must be True (set via ENABLE_LIVE_TRADING=true in .env).
+          2. quantity must be ≤ settings.max_order_size (MAX_ORDER_SIZE in .env).
+          3. dry_run=True (default) validates without placing — explicitly pass False to submit.
+          4. IB Gateway's "Read-Only API" must be OFF. Cannot be detected from the API side; if
+             still ON, the order will be rejected by IBKR with Error 201.
+
+        `legs`: list of {conId: int, ratio: int (default 1), action: 'BUY'|'SELL', exchange?: str}.
+        Example bull-put credit spread on SPY (sell 450P, buy 445P):
+          legs = [
+              {"conId": 12345, "ratio": 1, "action": "SELL"},   # short put (higher strike)
+              {"conId": 67890, "ratio": 1, "action": "BUY"},    # long put  (lower strike)
+          ]
+          order_action="SELL"  # selling the bag = net credit
+          limit_price=1.25      # minimum net credit (positive number)
+        """
+        try:
+            # Gate 1: live-trading flag
+            if not settings.enable_live_trading:
+                return {
+                    "blocked": True,
+                    "reason": "ENABLE_LIVE_TRADING=false in .env",
+                    "hint": "Set ENABLE_LIVE_TRADING=true in ~/Agents/ibkr-mcp-server/.env and restart the MCP. After that, dry_run=true is still the default — you must also explicitly pass dry_run=false to submit.",
+                }
+            # Gate 2: quantity cap
+            if quantity > settings.max_order_size:
+                return {
+                    "blocked": True,
+                    "reason": f"quantity {quantity} exceeds MAX_ORDER_SIZE={settings.max_order_size}",
+                }
+            # Gate 3: validate legs
+            if not legs or len(legs) < 2:
+                return {"error": "combo order requires at least 2 legs"}
+            normalized_legs = []
+            for leg in legs:
+                if 'conId' not in leg or 'action' not in leg:
+                    return {"error": "each leg needs conId + action (BUY/SELL)"}
+                act = str(leg['action']).upper()
+                if act not in ('BUY', 'SELL'):
+                    return {"error": f"invalid leg action: {leg['action']}"}
+                normalized_legs.append({
+                    "conId": int(leg['conId']),
+                    "ratio": int(leg.get('ratio', 1)),
+                    "action": act,
+                    "exchange": leg.get('exchange', exchange),
+                })
+
+            if not await self._ensure_connected():
+                raise IBKRConnectionError("Not connected to IBKR")
+
+            # Build BAG contract
+            bag = Contract()
+            bag.symbol = underlying
+            bag.secType = 'BAG'
+            bag.currency = currency
+            bag.exchange = exchange
+            bag.comboLegs = [
+                ComboLeg(
+                    conId=leg['conId'],
+                    ratio=leg['ratio'],
+                    action=leg['action'],
+                    exchange=leg['exchange'],
+                )
+                for leg in normalized_legs
+            ]
+
+            # Build Order
+            order = Order()
+            order.action = order_action.upper()
+            order.orderType = order_type
+            order.totalQuantity = quantity
+            if order_type == 'LMT':
+                order.lmtPrice = limit_price
+            order.tif = tif
+            if account or self.current_account:
+                order.account = account or self.current_account
+
+            # Dry-run: validate + describe, don't place
+            if dry_run:
+                return {
+                    "dry_run": True,
+                    "would_submit": True,
+                    "bag_contract": {
+                        "underlying": bag.symbol,
+                        "secType": bag.secType,
+                        "exchange": bag.exchange,
+                        "currency": bag.currency,
+                        "combo_legs": normalized_legs,
+                    },
+                    "order": {
+                        "action": order.action,
+                        "orderType": order.orderType,
+                        "totalQuantity": order.totalQuantity,
+                        "lmtPrice": getattr(order, 'lmtPrice', None),
+                        "tif": order.tif,
+                        "account": order.account,
+                    },
+                    "hint": "Re-call with dry_run=false to submit. NOTE: IB Gateway's Read-Only-API must be OFF — currently expected to be ON per project setup.",
+                }
+
+            # Actually place
+            self.logger.warning(
+                f"PLACING COMBO ORDER: {bag.symbol} {order.action} qty={quantity} "
+                f"limit={limit_price} legs={len(normalized_legs)} account={order.account}"
+            )
+            trade = self.ib.placeOrder(bag, order)
+            await asyncio.sleep(2.5)  # let initial events propagate
+
+            return {
+                "dry_run": False,
+                "order_id": trade.order.orderId,
+                "perm_id": getattr(trade.order, 'permId', None),
+                "status": trade.orderStatus.status,
+                "filled": safe_float(trade.orderStatus.filled),
+                "remaining": safe_float(trade.orderStatus.remaining),
+                "avg_fill_price": safe_float(trade.orderStatus.avgFillPrice),
+                "why_held": getattr(trade.orderStatus, 'whyHeld', None),
+                "last_log": [str(le) for le in trade.log[-5:]] if trade.log else [],
+                "error_201_hint": "If the order was immediately rejected/cancelled with Error 201, the IB Gateway's Read-Only-API flag is still ON. Disable it in Gateway → Configuration → API → Settings (then restart the Gateway).",
+            }
+
+        except Exception as e:
+            self.logger.error(f"Combo order placement failed: {e}")
             return {"error": str(e)}
 
     async def get_accounts(self) -> Dict[str, Union[str, List[str]]]:

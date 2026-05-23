@@ -100,6 +100,47 @@ TOOLS = [
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
     ),
     Tool(
+        name="place_combo_order",
+        description=(
+            "Place a multi-leg combo order (BAG contract) — designed for credit spreads. "
+            "TRIPLE-GATED: (1) ENABLE_LIVE_TRADING=true in .env, (2) quantity ≤ MAX_ORDER_SIZE, "
+            "(3) dry_run=false must be explicitly set. ALSO needs IB Gateway's 'Read-Only API' flag "
+            "to be OFF — currently expected ON; the order will be rejected with Error 201 otherwise."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "underlying": {"type": "string", "description": "Underlying symbol for the BAG (e.g. SPY)."},
+                "legs": {
+                    "type": "array",
+                    "description": "List of combo legs. Each: {conId, ratio (default 1), action: 'BUY'|'SELL', exchange (optional)}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "conId": {"type": "integer"},
+                            "ratio": {"type": "integer", "default": 1},
+                            "action": {"type": "string", "enum": ["BUY", "SELL"]},
+                            "exchange": {"type": "string"}
+                        },
+                        "required": ["conId", "action"]
+                    },
+                    "minItems": 2
+                },
+                "order_action": {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY", "description": "BAG-level action. For credit spreads (receive premium): SELL with positive limit_price."},
+                "quantity": {"type": "integer", "default": 1, "description": "Number of combos to place."},
+                "limit_price": {"type": "number", "default": 0.0, "description": "Net credit/debit per combo. Positive."},
+                "order_type": {"type": "string", "default": "LMT", "enum": ["LMT", "MKT"]},
+                "tif": {"type": "string", "default": "DAY", "enum": ["DAY", "GTC", "IOC", "FOK"]},
+                "account": {"type": "string", "description": "Account ID. Defaults to current account."},
+                "currency": {"type": "string", "default": "USD"},
+                "exchange": {"type": "string", "default": "SMART"},
+                "dry_run": {"type": "boolean", "default": True, "description": "True (default) validates and describes without placing. Set to false ONLY to actually submit."}
+            },
+            "required": ["underlying", "legs"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
         name="get_news",
         description=(
             "Get news headlines tied to a stock ticker via reqHistoricalNews. Default providers "
@@ -343,6 +384,25 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             return [TextContent(
                 type="text",
                 text=json.dumps(status, indent=2)
+            )]
+
+        elif name == "place_combo_order":
+            result = await ibkr_client.place_combo_order(
+                underlying=arguments["underlying"],
+                legs=arguments["legs"],
+                order_action=arguments.get("order_action", "BUY"),
+                quantity=arguments.get("quantity", 1),
+                limit_price=arguments.get("limit_price", 0.0),
+                order_type=arguments.get("order_type", "LMT"),
+                tif=arguments.get("tif", "DAY"),
+                account=arguments.get("account"),
+                currency=arguments.get("currency", "USD"),
+                exchange=arguments.get("exchange", "SMART"),
+                dry_run=arguments.get("dry_run", True),
+            )
+            return [TextContent(
+                type="text",
+                text=json.dumps(result, indent=2, default=str)
             )]
 
         elif name == "get_news":
