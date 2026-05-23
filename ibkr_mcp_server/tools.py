@@ -98,6 +98,31 @@ TOOLS = [
         name="get_connection_status",
         description="Check IBKR TWS/Gateway connection status and account information",
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+    ),
+    Tool(
+        name="get_market_data",
+        description=(
+            "Get a market-data quote (last/bid/ask/volume/high/low/close) for a stock, index, "
+            "future, option, or forex pair. For options, also returns delta/gamma/vega/theta/IV. "
+            "Without a market-data subscription, IBKR returns 15-min-delayed values."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Ticker symbol (e.g. AAPL, SPX, ES, EUR)"},
+                "sec_type": {"type": "string", "enum": ["STK", "IND", "FUT", "OPT", "CASH"], "default": "STK"},
+                "exchange": {"type": "string", "default": "SMART", "description": "Exchange routing. 'SMART' for stocks, 'CBOE' for SPX, 'CME' for ES, 'IDEALPRO' for forex."},
+                "currency": {"type": "string", "default": "USD"},
+                "expiry": {"type": "string", "description": "YYYYMMDD (OPT) or YYYYMM (FUT). Empty for STK/IND/CASH."},
+                "strike": {"type": "number", "description": "Strike price (OPT only)."},
+                "right": {"type": "string", "enum": ["C", "P", ""], "description": "Call (C) or Put (P) for options."},
+                "snapshot": {"type": "boolean", "default": False, "description": "True for one-off snapshot (no Greeks/OI/HV). False for streaming with full tick list."},
+                "generic_ticks": {"type": "string", "default": "100,101,104,106", "description": "Generic tick types: 100=OptVol, 101=OptOI, 104=HistVol, 106=ImpVol. Ignored in snapshot mode."},
+                "wait_seconds": {"type": "number", "default": 2.5, "description": "How long to wait for streaming ticks before reading the snapshot."}
+            },
+            "required": ["symbol"],
+            "additionalProperties": False
+        }
     )
 ]
 
@@ -218,6 +243,24 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             return [TextContent(
                 type="text",
                 text=json.dumps(status, indent=2)
+            )]
+
+        elif name == "get_market_data":
+            result = await ibkr_client.get_market_data(
+                symbol=arguments["symbol"],
+                sec_type=arguments.get("sec_type", "STK"),
+                exchange=arguments.get("exchange", "SMART"),
+                currency=arguments.get("currency", "USD"),
+                expiry=arguments.get("expiry", ""),
+                strike=arguments.get("strike", 0.0),
+                right=arguments.get("right", ""),
+                snapshot=arguments.get("snapshot", False),
+                generic_ticks=arguments.get("generic_ticks", "100,101,104,106"),
+                wait_seconds=arguments.get("wait_seconds", 2.5),
+            )
+            return [TextContent(
+                type="text",
+                text=json.dumps(result, indent=2, default=str)
             )]
         
         else:

@@ -5,9 +5,57 @@ import logging
 from typing import Dict, List, Optional, Union
 from decimal import Decimal
 
-from ib_async import IB, Stock, util
+from ib_async import IB, Stock, Index, Future, Option, Forex, Contract, util
 from .config import settings
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
+
+
+def _make_contract(
+    symbol: str,
+    sec_type: str = 'STK',
+    exchange: str = 'SMART',
+    currency: str = 'USD',
+    expiry: str = '',
+    strike: float = 0.0,
+    right: str = '',
+) -> Contract:
+    """Build an ib_async Contract for any supported security type.
+
+    sec_type: STK | IND | FUT | OPT | CASH (default: STK).
+    For FUT/OPT, `expiry` is YYYYMMDD or YYYYMM. OPT additionally needs strike+right (C/P).
+    """
+    sec_type = sec_type.upper()
+    if sec_type == 'STK':
+        return Stock(symbol, exchange, currency)
+    if sec_type == 'IND':
+        # Indices need a real exchange — CBOE for SPX/VIX, NASDAQ for COMP/NDX
+        return Index(symbol, exchange if exchange != 'SMART' else 'CBOE', currency)
+    if sec_type == 'FUT':
+        return Future(
+            symbol,
+            lastTradeDateOrContractMonth=expiry,
+            exchange=exchange if exchange != 'SMART' else 'CME',
+            currency=currency,
+        )
+    if sec_type == 'OPT':
+        return Option(
+            symbol,
+            lastTradeDateOrContractMonth=expiry,
+            strike=strike,
+            right=right.upper(),
+            exchange=exchange,
+            currency=currency,
+        )
+    if sec_type == 'CASH':
+        # Forex pairs: symbol is base currency, currency is quote
+        return Forex(f'{symbol}{currency}', exchange if exchange != 'SMART' else 'IDEALPRO')
+    # Generic fallback
+    c = Contract()
+    c.symbol = symbol
+    c.secType = sec_type
+    c.exchange = exchange
+    c.currency = currency
+    return c
 
 
 class IBKRClient:
@@ -78,7 +126,15 @@ class IBKRClient:
             # Setup event handlers
             self.ib.disconnectedEvent += self._on_disconnect
             self.ib.errorEvent += self._on_error
-            
+
+            # Apply market-data-type from settings (1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen).
+            # With no realtime subscription on the linked account, type 3 still delivers data.
+            try:
+                self.ib.reqMarketDataType(settings.ibkr_market_data_type)
+                self.logger.info(f"Market data type set to {settings.ibkr_market_data_type}")
+            except Exception as e:
+                self.logger.warning(f"reqMarketDataType({settings.ibkr_market_data_type}) failed: {e}")
+
             # Wait for connection to stabilize
             await asyncio.sleep(2)
             
@@ -325,6 +381,92 @@ class IBKRClient:
         except Exception as e:
             self.logger.error(f"Error switching account: {e}")
             return {"success": False, "error": str(e)}
+
+    @rate_limit(calls_per_second=2.0)
+    async def get_market_data(
+        self,
+        symbol: str,
+        sec_type: str = 'STK',
+        exchange: str = 'SMART',
+        currency: str = 'USD',
+        expiry: str = '',
+        strike: float = 0.0,
+        right: str = '',
+        snapshot: bool = False,
+        generic_ticks: str = '100,101,104,106',
+        wait_seconds: float = 2.5,
+    ) -> Dict:
+        """Get a market-data quote for any security type.
+
+        Returns last/bid/ask/volume/high/low/close. For options, additionally
+        returns delta/gamma/vega/theta/IV/underlying_price from model greeks.
+
+        Without a market-data subscription, IBKR returns 15-min-delayed values via
+        the `reqMarketDataType(3)` setting in .env. Snapshot mode does NOT accept
+        a generic_ticks list — OI/Volume/HV/IV need streaming.
+        """
+        try:
+            if not await self._ensure_connected():
+                raise IBKRConnectionError("Not connected to IBKR")
+
+            contract = _make_contract(
+                symbol=symbol, sec_type=sec_type, exchange=exchange, currency=currency,
+                expiry=expiry, strike=strike, right=right,
+            )
+            qualified = await self.ib.reqContractDetailsAsync(contract)
+            if not qualified:
+                return {"error": f"Contract not found for {symbol} ({sec_type})"}
+            contract = qualified[0].contract
+
+            # snapshot mode does not accept genericTickList
+            ticks = '' if snapshot else generic_ticks
+            ticker = self.ib.reqMktData(contract, ticks, snapshot, False)
+            try:
+                await asyncio.sleep(wait_seconds)
+                result = {
+                    "symbol": contract.symbol,
+                    "secType": contract.secType,
+                    "exchange": contract.exchange,
+                    "currency": contract.currency,
+                    "contract_id": contract.conId,
+                    "last": safe_float(ticker.last),
+                    "bid": safe_float(ticker.bid),
+                    "ask": safe_float(ticker.ask),
+                    "bid_size": safe_float(ticker.bidSize),
+                    "ask_size": safe_float(ticker.askSize),
+                    "volume": safe_float(ticker.volume),
+                    "high": safe_float(ticker.high),
+                    "low": safe_float(ticker.low),
+                    "close": safe_float(ticker.close),
+                    "halted": bool(getattr(ticker, 'halted', 0) or 0),
+                    "delayed": ticker.last == 0 and ticker.close != 0,  # heuristic
+                }
+                # Option contracts: surface modelGreeks if present
+                if contract.secType == 'OPT' and ticker.modelGreeks is not None:
+                    mg = ticker.modelGreeks
+                    result["greeks"] = {
+                        "iv": safe_float(mg.impliedVol),
+                        "delta": safe_float(mg.delta),
+                        "gamma": safe_float(mg.gamma),
+                        "vega": safe_float(mg.vega),
+                        "theta": safe_float(mg.theta),
+                        "underlying_price": safe_float(mg.undPrice),
+                        "option_price": safe_float(mg.optPrice),
+                    }
+                # OI and HV/IV from generic ticks (only on streaming)
+                if not snapshot:
+                    result["open_interest_call"] = safe_float(getattr(ticker, 'callOpenInterest', 0))
+                    result["open_interest_put"] = safe_float(getattr(ticker, 'putOpenInterest', 0))
+                    result["historical_vol"] = safe_float(getattr(ticker, 'histVolatility', 0))
+                    result["implied_vol_underlying"] = safe_float(getattr(ticker, 'impliedVolatility', 0))
+                return result
+            finally:
+                if not snapshot:
+                    self.ib.cancelMktData(contract)
+
+        except Exception as e:
+            self.logger.error(f"Market data request failed for {symbol}: {e}")
+            return {"error": str(e)}
 
     async def get_accounts(self) -> Dict[str, Union[str, List[str]]]:
         """Get available accounts information."""
