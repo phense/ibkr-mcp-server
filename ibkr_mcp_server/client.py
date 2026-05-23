@@ -468,6 +468,87 @@ class IBKRClient:
             self.logger.error(f"Market data request failed for {symbol}: {e}")
             return {"error": str(e)}
 
+    @rate_limit(calls_per_second=0.5)
+    async def get_historical_bars(
+        self,
+        symbol: str,
+        sec_type: str = 'STK',
+        exchange: str = 'SMART',
+        currency: str = 'USD',
+        expiry: str = '',
+        strike: float = 0.0,
+        right: str = '',
+        duration: str = '30 D',
+        bar_size: str = '1 day',
+        what_to_show: str = 'TRADES',
+        use_rth: bool = True,
+        end_datetime: str = '',
+    ) -> Dict:
+        """Fetch historical OHLCV bars.
+
+        Pacing limits (HARD — violation throws Error 162 or silent disconnect):
+        - ≤ 60 historical-data requests per 10-minute window (BID_ASK counted 2×).
+        - ≤ 6 identical (contract/endDate/barSize/whatToShow/RTH) requests in 2s.
+        - ≤ 2 identical historical-data requests in 15s.
+        - ≤ 50 simultaneous open historical-data requests.
+
+        Common durations: '60 S', '1 D', '1 W', '1 M', '6 M', '1 Y', '5 Y'.
+        Common bar sizes: '1 secs', '5 secs', '30 secs', '1 min', '5 mins',
+        '15 mins', '1 hour', '1 day', '1 week', '1 month'.
+        what_to_show: TRADES | MIDPOINT | BID | ASK | BID_ASK |
+        HISTORICAL_VOLATILITY | OPTION_IMPLIED_VOLATILITY.
+        """
+        try:
+            if not await self._ensure_connected():
+                raise IBKRConnectionError("Not connected to IBKR")
+
+            contract = _make_contract(
+                symbol=symbol, sec_type=sec_type, exchange=exchange, currency=currency,
+                expiry=expiry, strike=strike, right=right,
+            )
+            qualified = await self.ib.reqContractDetailsAsync(contract)
+            if not qualified:
+                return {"error": f"Contract not found for {symbol} ({sec_type})"}
+            contract = qualified[0].contract
+
+            bars = await self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime=end_datetime,
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow=what_to_show,
+                useRTH=use_rth,
+                formatDate=2,  # unix epoch — easier to parse than IB's localised strings
+            )
+            return {
+                "symbol": contract.symbol,
+                "secType": contract.secType,
+                "exchange": contract.exchange,
+                "currency": contract.currency,
+                "duration": duration,
+                "bar_size": bar_size,
+                "what_to_show": what_to_show,
+                "use_rth": use_rth,
+                "bar_count": len(bars) if bars else 0,
+                "bars": [
+                    {
+                        "date": str(b.date),
+                        "open": safe_float(b.open),
+                        "high": safe_float(b.high),
+                        "low": safe_float(b.low),
+                        "close": safe_float(b.close),
+                        "volume": safe_float(b.volume),
+                        "wap": safe_float(b.average),
+                        "count": safe_int(b.barCount),
+                    }
+                    for b in (bars or [])
+                ],
+            }
+
+        except Exception as e:
+            self.logger.error(f"Historical bars request failed for {symbol}: {e}")
+            return {"error": str(e)}
+
     async def get_accounts(self) -> Dict[str, Union[str, List[str]]]:
         """Get available accounts information."""
         try:

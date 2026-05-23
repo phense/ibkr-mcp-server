@@ -100,6 +100,34 @@ TOOLS = [
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
     ),
     Tool(
+        name="get_historical_bars",
+        description=(
+            "Fetch historical OHLCV bars for a stock/index/future/option/forex. "
+            "Respects IBKR pacing limits (60 requests per 10 minutes, 6 identical per 2 seconds). "
+            "Durations like '30 D', '1 Y'. Bar sizes like '1 day', '5 mins'. "
+            "what_to_show: TRADES | MIDPOINT | BID | ASK | BID_ASK | HISTORICAL_VOLATILITY | OPTION_IMPLIED_VOLATILITY."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "sec_type": {"type": "string", "enum": ["STK", "IND", "FUT", "OPT", "CASH"], "default": "STK"},
+                "exchange": {"type": "string", "default": "SMART"},
+                "currency": {"type": "string", "default": "USD"},
+                "expiry": {"type": "string", "description": "YYYYMMDD (OPT) or YYYYMM (FUT)."},
+                "strike": {"type": "number"},
+                "right": {"type": "string", "enum": ["C", "P", ""]},
+                "duration": {"type": "string", "default": "30 D", "description": "e.g. '60 S', '1 D', '1 W', '1 M', '6 M', '1 Y'."},
+                "bar_size": {"type": "string", "default": "1 day", "description": "e.g. '1 min', '5 mins', '1 hour', '1 day', '1 week'."},
+                "what_to_show": {"type": "string", "default": "TRADES"},
+                "use_rth": {"type": "boolean", "default": True, "description": "Regular trading hours only."},
+                "end_datetime": {"type": "string", "default": "", "description": "Empty for now; or 'YYYYMMDD HH:MM:SS UTC'."}
+            },
+            "required": ["symbol"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
         name="get_market_data",
         description=(
             "Get a market-data quote (last/bid/ask/volume/high/low/close) for a stock, index, "
@@ -243,6 +271,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             return [TextContent(
                 type="text",
                 text=json.dumps(status, indent=2)
+            )]
+
+        elif name == "get_historical_bars":
+            result = await ibkr_client.get_historical_bars(
+                symbol=arguments["symbol"],
+                sec_type=arguments.get("sec_type", "STK"),
+                exchange=arguments.get("exchange", "SMART"),
+                currency=arguments.get("currency", "USD"),
+                expiry=arguments.get("expiry", ""),
+                strike=arguments.get("strike", 0.0),
+                right=arguments.get("right", ""),
+                duration=arguments.get("duration", "30 D"),
+                bar_size=arguments.get("bar_size", "1 day"),
+                what_to_show=arguments.get("what_to_show", "TRADES"),
+                use_rth=arguments.get("use_rth", True),
+                end_datetime=arguments.get("end_datetime", ""),
+            )
+            return [TextContent(
+                type="text",
+                text=json.dumps(result, indent=2, default=str)
             )]
 
         elif name == "get_market_data":
