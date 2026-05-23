@@ -2,15 +2,14 @@
 
 A Model Context Protocol (MCP) server for Interactive Brokers, written in Python on top of `ib_async`. Speaks the TWS API directly over the IB Gateway / TWS socket (port 4002 paper / 4001 live by default).
 
-> **Soft fork.** Originally based on [ArjunDivecha/ibkr-mcp-server](https://github.com/ArjunDivecha/ibkr-mcp-server) (MIT, archived 2025). This fork (a) fixes API drift in newer dependencies, (b) corrects the documented tool surface to match what the code actually exposes, and (c) is being extended with the market-data, options-chain, fundamentals and combo-order tools needed for a credit-spread trading workflow. Upstream is preserved as the `upstream` git remote for attribution and rebase reference. The MIT license is unchanged.
+> **Soft fork.** Originally based on [ArjunDivecha/ibkr-mcp-server](https://github.com/ArjunDivecha/ibkr-mcp-server) (MIT, archived 2025). This fork (a) fixes API drift in newer dependencies, (b) corrects the documented tool surface, and (c) adds six market-data / fundamentals / execution tools (get_market_data, get_historical_bars, get_option_chain, get_fundamentals, get_news, place_combo_order) needed for a credit-spread trading workflow. Upstream is preserved as the `upstream` git remote for attribution. The MIT license is unchanged.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## What works today
+## Tool inventory (14 tools)
 
-Eight tools, focused on **account state, portfolio inspection, margin and shortable-shares analysis**. Read-only on the IBKR side — order placement is not implemented.
-
+**Account + risk (8, inherited from upstream):**
 | Tool | Returns |
 |---|---|
 | `get_connection_status` | host / port / client_id / current_account / paper_trading flag |
@@ -22,18 +21,17 @@ Eight tools, focused on **account state, portfolio inspection, margin and shorta
 | `get_margin_requirements` | initial + maintenance margin per symbol |
 | `short_selling_analysis` | composite shortable + margin summary |
 
-## Roadmap (not yet implemented)
+**Market data, fundamentals, execution (6, added in this fork):**
+| Tool | Returns |
+|---|---|
+| `get_market_data` | last/bid/ask/volume/high/low/close for any security type; Greeks + IV for OPT contracts |
+| `get_historical_bars` | OHLCV bars; respects IBKR pacing (60/10min, 6 identical/2s, BID_ASK 2× counted) |
+| `get_option_chain` | strikes + per-strike Bid/Ask + Delta/Gamma/Vega/Theta + IV + OI + Volume, pre-prunable |
+| `get_fundamentals` | Reuters/Refinitiv reports: ReportSnapshot / ReportsFinSummary / ReportRatios / RESC / CalendarReport (raw XML) |
+| `get_news` | News headlines via reqHistoricalNews (default BRFG/BRFUPDN/DJNL); optional article bodies |
+| `place_combo_order` | atomic multi-leg BAG order for credit spreads. Triple-gated (ENABLE_LIVE_TRADING + MAX_ORDER_SIZE + dry_run=false) |
 
-These tools exist in the underlying `ib_async` library but are not yet wrapped as MCP tools. They are on the work list for this fork — see the `roadmap-*` branches as they appear.
-
-| Tool (planned) | What it will return | Priority |
-|---|---|---|
-| `get_market_data(symbol)` | snapshot or streaming quote — last / bid / ask / volume, with `genericTickList` for IV and Greeks on option contracts | high |
-| `get_historical_bars(symbol, duration, bar_size)` | OHLCV bars; daily back decades, intraday 1-min/5-min back ~1 year (within IBKR pacing limits) | high |
-| `get_option_chain(underlying, expiry)` | strikes + per-strike Bid/Ask + Delta/Gamma/Vega/Theta + IV + Open Interest + Volume | high — required for credit spreads |
-| `get_fundamentals(symbol)` | Reuters reports: EPS history, earnings calendar, P/E, market cap, dividend history | medium |
-| `get_news(symbol, count)` | IB news flow (Briefing.com, Dow Jones Newsletters, BRFUPDN — no full Reuters newswire via API) | medium |
-| `place_combo_order(legs, qty, limit)` | atomic multi-leg order (BAG contract) for credit spreads, iron condors, etc. Live-trading flag gated | low (last — requires `ENABLE_LIVE_TRADING=true` + explicit clearance) |
+**Data tier:** Without market-data subscriptions, the MCP runs at `reqMarketDataType(3)` (15-min delayed) — applied automatically on connect. See [docs/API.md](docs/API.md) for the per-tool quirks and subscription tiers needed for realtime quotes.
 
 ## Quick start
 
@@ -60,7 +58,9 @@ Start IB Gateway / TWS, ensure the API is enabled, then:
 python -m ibkr_mcp_server.main --test
 ```
 
-Expected: `Loaded 8 tools, All tests passed`.
+Expected: `Loaded 14 tools, All tests passed`.
+
+If clientId 1 is already taken by a running MCP instance, run with a unique ID: `IBKR_CLIENT_ID=99 python -m ibkr_mcp_server.main --test`.
 
 ### Claude Code integration
 
