@@ -85,9 +85,11 @@ async def test_connection():
         console.print(f"📊 Found {len(accounts)} accounts")
         
         # Test tools
+        # In mcp >= 1.x, `server.list_tools` is a decorator (not a list returner).
+        # Use the module-level TOOLS constant declared alongside the registered handler.
+        from .tools import TOOLS
         console.print("🛠️ Testing MCP tools...")
-        tools = server.list_tools()
-        console.print(f"⚙️ Loaded {len(tools)} tools")
+        console.print(f"⚙️ Loaded {len(TOOLS)} tools")
         
         console.print("[bold green]✅ All tests passed![/bold green]")
         return True
