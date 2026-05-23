@@ -720,6 +720,125 @@ class IBKRClient:
             self.logger.error(f"Option chain request failed for {underlying}: {e}")
             return {"error": str(e)}
 
+    @rate_limit(calls_per_second=0.5)
+    async def get_fundamentals(
+        self,
+        symbol: str,
+        report_type: str = 'ReportSnapshot',
+        exchange: str = 'SMART',
+        currency: str = 'USD',
+    ) -> Dict:
+        """Get Reuters/Refinitiv fundamental data via reqFundamentalData.
+
+        report_type:
+          - ReportSnapshot — P/E, ratios, market cap, beta
+          - ReportsFinSummary — 4-quarter EPS/revenue history
+          - ReportRatios — financial ratios
+          - ReportsFinStatements — balance sheet / income / cash flow
+          - RESC — analyst EPS estimates
+          - CalendarReport — earnings dates ± 3 weeks
+
+        Requires Reuters Worldwide Fundamentals subscription (USD 11/mo non-pro,
+        waived ≥ USD 30/mo commissions). Returns raw XML — caller parses.
+        """
+        try:
+            if not await self._ensure_connected():
+                raise IBKRConnectionError("Not connected to IBKR")
+            contract = _make_contract(
+                symbol=symbol, sec_type='STK', exchange=exchange, currency=currency,
+            )
+            qualified = await self.ib.reqContractDetailsAsync(contract)
+            if not qualified:
+                return {"error": f"Contract not found: {symbol}"}
+            contract = qualified[0].contract
+
+            xml = await self.ib.reqFundamentalDataAsync(contract, report_type)
+            if not xml:
+                return {
+                    "error": f"No fundamental data returned for {symbol} / {report_type}",
+                    "hint": "Reuters Worldwide Fundamentals subscription required (USD 11/mo non-pro).",
+                }
+            return {
+                "symbol": contract.symbol,
+                "contract_id": contract.conId,
+                "report_type": report_type,
+                "xml": xml,
+                "xml_length": len(xml),
+            }
+        except Exception as e:
+            self.logger.error(f"Fundamentals request failed for {symbol}: {e}")
+            return {"error": str(e)}
+
+    @rate_limit(calls_per_second=0.5)
+    async def get_news(
+        self,
+        symbol: str,
+        max_results: int = 20,
+        providers: str = 'BRFG+BRFUPDN+DJNL',
+        start_datetime: str = '',
+        end_datetime: str = '',
+        fetch_bodies: bool = False,
+        exchange: str = 'SMART',
+        currency: str = 'USD',
+    ) -> Dict:
+        """Get news headlines tied to a stock ticker via reqHistoricalNews.
+
+        Default providers (BRFG / BRFUPDN / DJNL) are free with API access.
+        Reuters and the full Dow Jones newswire are NOT API-exposed (TWS panel
+        only). Optional API add-ons: Benzinga Pro USD 99/mo, Fly on the Wall
+        USD 30/mo.
+
+        With `fetch_bodies=True` calls reqNewsArticle per headline — slow for
+        large `max_results`.
+        """
+        try:
+            if not await self._ensure_connected():
+                raise IBKRConnectionError("Not connected to IBKR")
+            contract = _make_contract(
+                symbol=symbol, sec_type='STK', exchange=exchange, currency=currency,
+            )
+            qualified = await self.ib.reqContractDetailsAsync(contract)
+            if not qualified:
+                return {"error": f"Contract not found: {symbol}"}
+            contract = qualified[0].contract
+
+            news = await self.ib.reqHistoricalNewsAsync(
+                conId=contract.conId,
+                providerCodes=providers,
+                startDateTime=start_datetime,
+                endDateTime=end_datetime,
+                totalResults=max_results,
+            )
+
+            headlines = []
+            for h in (news or []):
+                entry = {
+                    "time": str(h.time),
+                    "provider": h.providerCode,
+                    "article_id": h.articleId,
+                    "headline": h.headline,
+                }
+                if fetch_bodies:
+                    try:
+                        article = await self.ib.reqNewsArticleAsync(h.providerCode, h.articleId)
+                        entry["article_text"] = getattr(article, 'articleText', None) if article else None
+                        entry["article_type"] = getattr(article, 'articleType', None) if article else None
+                    except Exception as ae:
+                        entry["article_fetch_error"] = str(ae)
+                headlines.append(entry)
+
+            return {
+                "symbol": contract.symbol,
+                "contract_id": contract.conId,
+                "providers_requested": providers,
+                "max_results": max_results,
+                "headline_count": len(headlines),
+                "headlines": headlines,
+            }
+        except Exception as e:
+            self.logger.error(f"News request failed for {symbol}: {e}")
+            return {"error": str(e)}
+
     async def get_accounts(self) -> Dict[str, Union[str, List[str]]]:
         """Get available accounts information."""
         try:

@@ -100,6 +100,53 @@ TOOLS = [
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
     ),
     Tool(
+        name="get_news",
+        description=(
+            "Get news headlines tied to a stock ticker via reqHistoricalNews. Default providers "
+            "(BRFG/BRFUPDN/DJNL) are free with API access. Reuters and full Dow Jones newswire are NOT "
+            "API-exposed (TWS panel only). With fetch_bodies=true, also pulls article bodies."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "max_results": {"type": "integer", "default": 20},
+                "providers": {"type": "string", "default": "BRFG+BRFUPDN+DJNL", "description": "Plus-separated provider codes."},
+                "start_datetime": {"type": "string", "default": "", "description": "Empty for far back; or 'YYYYMMDD HH:MM:SS UTC'."},
+                "end_datetime": {"type": "string", "default": "", "description": "Empty for now; or 'YYYYMMDD HH:MM:SS UTC'."},
+                "fetch_bodies": {"type": "boolean", "default": False, "description": "If true, calls reqNewsArticle per headline (slow)."},
+                "exchange": {"type": "string", "default": "SMART"},
+                "currency": {"type": "string", "default": "USD"}
+            },
+            "required": ["symbol"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="get_fundamentals",
+        description=(
+            "Get Reuters/Refinitiv fundamentals XML for a stock. Reports: ReportSnapshot (P/E, ratios, market cap), "
+            "ReportsFinSummary (4Q EPS/revenue), ReportRatios, ReportsFinStatements (balance sheet/IS/cashflow), "
+            "RESC (analyst EPS estimates), CalendarReport (earnings dates ±3 weeks). "
+            "Requires Reuters Worldwide Fundamentals subscription (USD 11/mo non-pro). Returns raw XML."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "report_type": {
+                    "type": "string",
+                    "enum": ["ReportSnapshot", "ReportsFinSummary", "ReportRatios", "ReportsFinStatements", "RESC", "CalendarReport"],
+                    "default": "ReportSnapshot"
+                },
+                "exchange": {"type": "string", "default": "SMART"},
+                "currency": {"type": "string", "default": "USD"}
+            },
+            "required": ["symbol"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
         name="get_option_chain",
         description=(
             "Get option chain for an underlying — strikes, Greeks (delta/gamma/vega/theta), "
@@ -296,6 +343,34 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             return [TextContent(
                 type="text",
                 text=json.dumps(status, indent=2)
+            )]
+
+        elif name == "get_news":
+            result = await ibkr_client.get_news(
+                symbol=arguments["symbol"],
+                max_results=arguments.get("max_results", 20),
+                providers=arguments.get("providers", "BRFG+BRFUPDN+DJNL"),
+                start_datetime=arguments.get("start_datetime", ""),
+                end_datetime=arguments.get("end_datetime", ""),
+                fetch_bodies=arguments.get("fetch_bodies", False),
+                exchange=arguments.get("exchange", "SMART"),
+                currency=arguments.get("currency", "USD"),
+            )
+            return [TextContent(
+                type="text",
+                text=json.dumps(result, indent=2, default=str)
+            )]
+
+        elif name == "get_fundamentals":
+            result = await ibkr_client.get_fundamentals(
+                symbol=arguments["symbol"],
+                report_type=arguments.get("report_type", "ReportSnapshot"),
+                exchange=arguments.get("exchange", "SMART"),
+                currency=arguments.get("currency", "USD"),
+            )
+            return [TextContent(
+                type="text",
+                text=json.dumps(result, indent=2, default=str)
             )]
 
         elif name == "get_option_chain":
