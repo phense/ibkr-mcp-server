@@ -216,7 +216,7 @@ TOOLS = [
     Tool(
         name="get_historical_bars",
         description=(
-            "Fetch historical OHLCV bars for a stock/index/future/option/forex. "
+            "Fetch historical OHLCV bars for a stock/index/future/option/forex, IOPT/WAR (German leverage products). "
             "Respects IBKR pacing limits (60 requests per 10 minutes, 6 identical per 2 seconds). "
             "Durations like '30 D', '1 Y'. Bar sizes like '1 day', '5 mins'. "
             "what_to_show: TRADES | MIDPOINT | BID | ASK | BID_ASK | HISTORICAL_VOLATILITY | OPTION_IMPLIED_VOLATILITY."
@@ -227,8 +227,8 @@ TOOLS = [
                 "symbol": {"type": "string"},
                 "sec_type": {"type": "string", "enum": ["STK", "IND", "FUT", "OPT", "CASH", "IOPT", "WAR"], "default": "STK"},
                 "exchange": {"type": "string", "default": "SMART"},
-                "currency": {"type": "string", "default": "USD", "description": "Currency; EUR for IOPT/WAR."},
-                "isin": {"type": "string", "description": "ISIN for German leverage products (IOPT/WAR); resolves on SWB/EUR. Leave symbol empty when using ISIN."},
+                "currency": {"type": "string", "default": "USD", "description": "Currency, e.g. USD; use EUR for IOPT/WAR."},
+                "isin": {"type": "string", "description": "ISIN for German leverage products (IOPT/WAR); resolves on SWB/EUR. Pass an empty string for symbol when using ISIN."},
                 "expiry": {"type": "string", "description": "YYYYMMDD (OPT) or YYYYMM (FUT)."},
                 "strike": {"type": "number"},
                 "right": {"type": "string", "enum": ["C", "P", ""]},
@@ -246,7 +246,7 @@ TOOLS = [
         name="get_market_data",
         description=(
             "Get a market-data quote (last/bid/ask/volume/high/low/close) for a stock, index, "
-            "future, option, or forex pair. For options, also returns delta/gamma/vega/theta/IV. "
+            "future, option, forex pair, or IOPT/WAR (German leverage products). For options, also returns delta/gamma/vega/theta/IV. "
             "Without a market-data subscription, IBKR returns 15-min-delayed values."
         ),
         inputSchema={
@@ -255,8 +255,8 @@ TOOLS = [
                 "symbol": {"type": "string", "description": "Ticker symbol (e.g. AAPL, SPX, ES, EUR)"},
                 "sec_type": {"type": "string", "enum": ["STK", "IND", "FUT", "OPT", "CASH", "IOPT", "WAR"], "default": "STK"},
                 "exchange": {"type": "string", "default": "SMART", "description": "Exchange routing. 'SMART' for stocks, 'CBOE' for SPX, 'CME' for ES, 'IDEALPRO' for forex."},
-                "currency": {"type": "string", "default": "USD", "description": "Currency; EUR for IOPT/WAR."},
-                "isin": {"type": "string", "description": "ISIN for German leverage products (IOPT/WAR); resolves on SWB/EUR. Leave symbol empty when using ISIN."},
+                "currency": {"type": "string", "default": "USD", "description": "Currency, e.g. USD; use EUR for IOPT/WAR."},
+                "isin": {"type": "string", "description": "ISIN for German leverage products (IOPT/WAR); resolves on SWB/EUR. Pass an empty string for symbol when using ISIN."},
                 "expiry": {"type": "string", "description": "YYYYMMDD (OPT) or YYYYMM (FUT). Empty for STK/IND/CASH."},
                 "strike": {"type": "number", "description": "Strike price (OPT only)."},
                 "right": {"type": "string", "enum": ["C", "P", ""], "description": "Call (C) or Put (P) for options."},
