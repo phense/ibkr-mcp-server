@@ -529,6 +529,7 @@ class IBKRClient:
         expiry: str = '',
         strike: float = 0.0,
         right: str = '',
+        isin: str = '',
         snapshot: bool = False,
         generic_ticks: str = '100,101,104,106',
         wait_seconds: float = 2.5,
@@ -548,7 +549,7 @@ class IBKRClient:
 
             contract = _make_contract(
                 symbol=symbol, sec_type=sec_type, exchange=exchange, currency=currency,
-                expiry=expiry, strike=strike, right=right,
+                expiry=expiry, strike=strike, right=right, isin=isin,
             )
             qualified = await self.ib.reqContractDetailsAsync(contract)
             if not qualified:
@@ -615,6 +616,7 @@ class IBKRClient:
         expiry: str = '',
         strike: float = 0.0,
         right: str = '',
+        isin: str = '',
         duration: str = '30 D',
         bar_size: str = '1 day',
         what_to_show: str = 'TRADES',
@@ -641,7 +643,7 @@ class IBKRClient:
 
             contract = _make_contract(
                 symbol=symbol, sec_type=sec_type, exchange=exchange, currency=currency,
-                expiry=expiry, strike=strike, right=right,
+                expiry=expiry, strike=strike, right=right, isin=isin,
             )
             qualified = await self.ib.reqContractDetailsAsync(contract)
             if not qualified:
