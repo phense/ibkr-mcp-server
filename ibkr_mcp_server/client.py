@@ -18,11 +18,13 @@ def _make_contract(
     expiry: str = '',
     strike: float = 0.0,
     right: str = '',
+    isin: str = '',
 ) -> Contract:
     """Build an ib_async Contract for any supported security type.
 
-    sec_type: STK | IND | FUT | OPT | CASH (default: STK).
+    sec_type: STK | IND | FUT | OPT | CASH | IOPT | WAR (default: STK).
     For FUT/OPT, `expiry` is YYYYMMDD or YYYYMM. OPT additionally needs strike+right (C/P).
+    For IOPT/WAR (German leverage products), pass `isin` — resolves on SWB/EUR.
     """
     sec_type = sec_type.upper()
     if sec_type == 'STK':
@@ -49,6 +51,26 @@ def _make_contract(
     if sec_type == 'CASH':
         # Forex pairs: symbol is base currency, currency is quote
         return Forex(f'{symbol}{currency}', exchange if exchange != 'SMART' else 'IDEALPRO')
+    if sec_type in ('IOPT', 'WAR'):
+        # German leverage products (Faktor-OS / Zertifikate) resolve by ISIN
+        # on Börse Stuttgart (SWB) in EUR. SMART/IBIS/FWB/GETTEX do NOT resolve.
+        # When the caller leaves exchange at the generic default (SMART), default
+        # both exchange and currency to the SWB/EUR pair. An explicit exchange
+        # override implies the caller also controls currency.
+        c = Contract()
+        if exchange != 'SMART':
+            c.exchange = exchange
+            c.currency = currency
+        else:
+            c.exchange = 'SWB'
+            c.currency = 'EUR'
+        c.secType = sec_type
+        if isin:
+            c.secIdType = 'ISIN'
+            c.secId = isin
+        if symbol:
+            c.symbol = symbol
+        return c
     # Generic fallback
     c = Contract()
     c.symbol = symbol
