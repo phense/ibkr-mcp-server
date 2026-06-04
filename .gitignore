@@ -55,3 +55,6 @@ Thumbs.db
 *.TWS
 *.xml
 *.out
+
+# Maintainer's private working backlog — kept on disk, out of the public fork.
+/BACKLOG.md
