@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     
     # Trading Safety
     enable_live_trading: bool = False
-    max_order_size: int = 1000
+    max_order_size: int = 1  # fat-finger gate: 1 contract until deliberately raised per-strategy
     require_order_confirmation: bool = True
     
     # MCP Server
