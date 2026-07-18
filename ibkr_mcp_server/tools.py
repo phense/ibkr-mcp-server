@@ -52,8 +52,31 @@ TOOLS = [
     ),
     Tool(
         name="get_accounts",
-        description="Get available IBKR accounts and current account", 
+        description="Get available IBKR accounts and current account",
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+    ),
+    Tool(
+        name="get_open_orders",
+        description="Read back ALL open/working orders on the gateway across every API client id (including orders placed by other clients, e.g. a trading engine). Broker order-book verification surface.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "account": {"type": "string", "description": "Filter to one account ID (optional)"}
+            },
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="get_executions",
+        description="Read back TODAY's executions (fills) with commissions across all API clients. IBKR serves only current-day fills over the API. Use to verify what actually filled after any order activity.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "account": {"type": "string", "description": "Filter to one account ID (optional)"},
+                "symbol": {"type": "string", "description": "Filter to one underlying symbol (optional)"}
+            },
+            "additionalProperties": False
+        }
     ),
     Tool(
         name="check_shortable_shares",
@@ -312,6 +335,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             return [TextContent(
                 type="text",
                 text=json.dumps(accounts, indent=2)
+            )]
+
+        elif name == "get_open_orders":
+            orders = await ibkr_client.get_open_orders(arguments.get("account"))
+            return [TextContent(
+                type="text",
+                text=json.dumps(orders, indent=2, default=str)
+            )]
+
+        elif name == "get_executions":
+            fills = await ibkr_client.get_executions(
+                account=arguments.get("account"),
+                symbol=arguments.get("symbol"),
+            )
+            return [TextContent(
+                type="text",
+                text=json.dumps(fills, indent=2, default=str)
             )]
             
         elif name == "check_shortable_shares":

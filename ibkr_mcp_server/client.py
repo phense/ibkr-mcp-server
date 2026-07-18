@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Union
 from decimal import Decimal
 
 from ib_async import IB, Stock, Index, Future, Option, Forex, Contract, ComboLeg, Order, util
+from ib_async import ExecutionFilter
 from .config import settings
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
@@ -133,18 +134,13 @@ class IBKRClient:
             return self._connected
         
         self._connecting = True
-        
+
         try:
             self.ib = IB()
-            
+
             self.logger.info(f"Connecting to IBKR at {self.host}:{self.port}...")
-            await self.ib.connectAsync(
-                host=self.host,
-                port=self.port,
-                clientId=self.client_id,
-                timeout=10
-            )
-            
+            await self._connect_with_client_id_fallback()
+
             # Setup event handlers
             self.ib.disconnectedEvent += self._on_disconnect
             self.ib.errorEvent += self._on_error
@@ -180,7 +176,38 @@ class IBKRClient:
             raise IBKRConnectionError(f"Connection failed: {e}")
         finally:
             self._connecting = False
-    
+
+    # Client ids 1-9 are the MCP's reserved band on this gateway (the trading
+    # engine's id family starts at 20). A gateway rejects a duplicate clientId
+    # with Error 326, which ib_async surfaces as a connect TimeoutError — a
+    # parallel session's MCP or an orphaned process can therefore wedge the
+    # read-back surface on a fixed id. Walk the band instead of failing.
+    CLIENT_ID_BAND = 9
+
+    async def _connect_with_client_id_fallback(self):
+        base = self.client_id
+        last_exc: Exception = RuntimeError("no connect attempt made")
+        for offset in range(self.CLIENT_ID_BAND):
+            candidate = base + offset
+            try:
+                await self.ib.connectAsync(
+                    host=self.host,
+                    port=self.port,
+                    clientId=candidate,
+                    timeout=10
+                )
+                if candidate != base:
+                    self.logger.warning(
+                        f"clientId {base} unavailable (likely in use); connected as {candidate}")
+                self.client_id = candidate
+                return
+            except (TimeoutError, asyncio.TimeoutError, ConnectionRefusedError) as e:
+                last_exc = e
+                if isinstance(e, ConnectionRefusedError):
+                    break  # gateway down — other ids won't help
+                self.logger.warning(f"connectAsync clientId={candidate} failed: {type(e).__name__}")
+        raise last_exc
+
     async def disconnect(self):
         """Clean disconnection."""
         if self.ib and self.ib.isConnected():
@@ -262,7 +289,58 @@ class IBKRClient:
         except Exception as e:
             self.logger.error(f"Account summary request failed: {e}")
             raise RuntimeError(f"IBKR API error: {str(e)}")
-    
+
+    @rate_limit(calls_per_second=1.0)
+    async def get_open_orders(self, account: Optional[str] = None) -> List[Dict]:
+        """Get ALL open/working orders on the gateway, across every API client id.
+
+        Uses reqAllOpenOrders so orders placed by OTHER clients (e.g. an
+        execution engine on its own client ids) are visible too — this is a
+        read-back surface for verifying the broker's actual order book, not a
+        view of this client's own orders.
+        """
+        try:
+            if not await self._ensure_connected():
+                raise ConnectionError("Not connected to IBKR")
+
+            trades = await self.ib.reqAllOpenOrdersAsync()
+            out = []
+            for t in trades:
+                order_account = getattr(t.order, 'account', '')
+                if account and order_account and order_account != account:
+                    continue
+                out.append(self._serialize_open_order(t))
+            return out
+
+        except Exception as e:
+            self.logger.error(f"Open-orders request failed: {e}")
+            raise RuntimeError(f"IBKR API error: {str(e)}")
+
+    @rate_limit(calls_per_second=1.0)
+    async def get_executions(self, account: Optional[str] = None,
+                             symbol: Optional[str] = None) -> List[Dict]:
+        """Get TODAY's executions (fills) with commissions, across all API clients.
+
+        IBKR only serves current-day executions over the API (older fills live in
+        Flex reports). Read-back surface for verifying what actually filled after
+        any order mutation.
+        """
+        try:
+            if not await self._ensure_connected():
+                raise ConnectionError("Not connected to IBKR")
+
+            filt = ExecutionFilter()
+            if account:
+                filt.acctCode = account
+            if symbol:
+                filt.symbol = symbol
+            fills = await self.ib.reqExecutionsAsync(filt)
+            return [self._serialize_fill(f) for f in fills]
+
+        except Exception as e:
+            self.logger.error(f"Executions request failed: {e}")
+            raise RuntimeError(f"IBKR API error: {str(e)}")
+
     @rate_limit(calls_per_second=0.5)
     async def get_shortable_shares(self, symbol: str, account: str = None) -> Dict:
         """Get short selling availability for a symbol.
@@ -1176,6 +1254,82 @@ class IBKRClient:
             "account": position.account
         }
     
+    def _serialize_contract_brief(self, c) -> Dict:
+        """Compact contract identity for order/fill read-backs."""
+        d = {
+            "symbol": getattr(c, 'symbol', ''),
+            "secType": getattr(c, 'secType', ''),
+            "localSymbol": getattr(c, 'localSymbol', ''),
+            "exchange": getattr(c, 'exchange', ''),
+            "currency": getattr(c, 'currency', ''),
+        }
+        if getattr(c, 'lastTradeDateOrContractMonth', ''):
+            d["expiry"] = c.lastTradeDateOrContractMonth
+        if safe_float(getattr(c, 'strike', 0)):
+            d["strike"] = safe_float(c.strike)
+        if getattr(c, 'right', ''):
+            d["right"] = c.right
+        legs = getattr(c, 'comboLegs', None) or []
+        if legs:
+            d["comboLegs"] = [
+                {"conId": safe_int(getattr(leg, 'conId', 0)),
+                 "ratio": safe_int(getattr(leg, 'ratio', 0)),
+                 "action": getattr(leg, 'action', '')}
+                for leg in legs
+            ]
+        return d
+
+    def _serialize_open_order(self, trade) -> Dict:
+        """Convert an ib_async Trade (open order) to a serializable dict."""
+        o = trade.order
+        st = getattr(trade, 'orderStatus', None)
+        return {
+            "orderId": safe_int(getattr(o, 'orderId', 0)),
+            "permId": safe_int(getattr(o, 'permId', 0)),
+            "clientId": safe_int(getattr(o, 'clientId', 0)),
+            "account": getattr(o, 'account', ''),
+            "orderRef": getattr(o, 'orderRef', ''),
+            "action": getattr(o, 'action', ''),
+            "totalQuantity": safe_float(getattr(o, 'totalQuantity', 0)),
+            "orderType": getattr(o, 'orderType', ''),
+            "lmtPrice": safe_float(getattr(o, 'lmtPrice', 0)),
+            "auxPrice": safe_float(getattr(o, 'auxPrice', 0)),
+            "tif": getattr(o, 'tif', ''),
+            "status": getattr(st, 'status', '') if st else '',
+            "filled": safe_float(getattr(st, 'filled', 0)) if st else 0.0,
+            "remaining": safe_float(getattr(st, 'remaining', 0)) if st else 0.0,
+            "avgFillPrice": safe_float(getattr(st, 'avgFillPrice', 0)) if st else 0.0,
+            "contract": self._serialize_contract_brief(trade.contract),
+        }
+
+    def _serialize_fill(self, fill) -> Dict:
+        """Convert an ib_async Fill to a serializable dict (incl. commission)."""
+        ex = fill.execution
+        cr = getattr(fill, 'commissionReport', None)
+
+        def _pnl_or_none(value):
+            # IBKR reports DBL_MAX when a per-fill value is unset
+            v = safe_float(value)
+            return None if abs(v) > 1e300 else v
+
+        return {
+            "execId": getattr(ex, 'execId', ''),
+            "time": str(getattr(ex, 'time', '')),
+            "account": getattr(ex, 'acctNumber', ''),
+            "side": getattr(ex, 'side', ''),
+            "shares": safe_float(getattr(ex, 'shares', 0)),
+            "price": safe_float(getattr(ex, 'price', 0)),
+            "permId": safe_int(getattr(ex, 'permId', 0)),
+            "clientId": safe_int(getattr(ex, 'clientId', 0)),
+            "orderId": safe_int(getattr(ex, 'orderId', 0)),
+            "orderRef": getattr(ex, 'orderRef', ''),
+            "cumQty": safe_float(getattr(ex, 'cumQty', 0)),
+            "avgPrice": safe_float(getattr(ex, 'avgPrice', 0)),
+            "commission": _pnl_or_none(getattr(cr, 'commission', None)) if cr else None,
+            "realizedPNL": _pnl_or_none(getattr(cr, 'realizedPNL', None)) if cr else None,
+            "contract": self._serialize_contract_brief(fill.contract),
+        }
+
     def _serialize_account_value(self, account_value) -> Dict:
         """Convert AccountValue to serializable dict."""
         return {

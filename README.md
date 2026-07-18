@@ -7,7 +7,7 @@ A Model Context Protocol (MCP) server for Interactive Brokers, written in Python
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Tool inventory (14 tools)
+## Tool inventory (16 tools)
 
 **Account + risk (8, inherited from upstream):**
 | Tool | Returns |
@@ -30,6 +30,14 @@ A Model Context Protocol (MCP) server for Interactive Brokers, written in Python
 | `get_fundamentals` | Reuters/Refinitiv reports: ReportSnapshot / ReportsFinSummary / ReportRatios / RESC / CalendarReport (raw XML) |
 | `get_news` | News headlines via reqHistoricalNews (default BRFG/BRFUPDN/DJNL); optional article bodies |
 | `place_combo_order` | atomic multi-leg BAG order for credit spreads. Triple-gated (ENABLE_LIVE_TRADING + MAX_ORDER_SIZE + dry_run=false) |
+
+**Broker read-back surface (2, added in this fork):**
+| Tool | Returns |
+|---|---|
+| `get_open_orders` | ALL open/working orders across every API client id on the gateway (reqAllOpenOrders) — verifies the broker's actual order book incl. orders placed by other clients (e.g. an execution engine) |
+| `get_executions` | TODAY's fills across all API clients (reqExecutions), incl. per-fill commission and realized PnL where reported. IBKR serves current-day fills only |
+
+**Client-id resilience:** if the configured `IBKR_CLIENT_ID` is already registered on the gateway (Error 326 — a parallel session or an orphaned process), connect walks the reserved id band (base..base+8) instead of failing, and logs the substitution.
 
 **Data tier:** Without market-data subscriptions, the MCP runs at `reqMarketDataType(3)` (15-min delayed) — applied automatically on connect. See [docs/API.md](docs/API.md) for the per-tool quirks and subscription tiers needed for realtime quotes.
 
